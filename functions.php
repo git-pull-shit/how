@@ -52,11 +52,11 @@ function alean_api_request($url, $data, $timeout = 15) {
  * Добавляем CSP заголовки для решения проблемы с worker'ами
  */
 function add_csp_headers() {
-    if (!is_admin()) {
+    if (!is_admin() && !headers_sent()) {
         header("Content-Security-Policy: script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://*.googleapis.com https://*.gstatic.com blob:; worker-src 'self' blob:;");
     }
 }
-add_action('send_headers', 'add_csp_headers');
+add_action('template_redirect', 'add_csp_headers', 1);
 
 /**
  * ВРЕМЕННАЯ функция для тестирования API (удалить после отладки)
@@ -2094,6 +2094,15 @@ add_action('wp_ajax_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart
 add_action('wp_ajax_nopriv_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart');
 
 function woocommerce_ajax_add_to_cart() {
+    // Начинаем буферизацию вывода для предотвращения проблем с заголовками
+    ob_start();
+    
+    // Отключаем вывод ошибок в AJAX запросах
+    if (!defined('WP_DEBUG') || !WP_DEBUG) {
+        error_reporting(0);
+        ini_set('display_errors', 0);
+    }
+    
     // Отладочная информация (отключить в продакшене)
     $debug = defined('WP_DEBUG') && WP_DEBUG;
     if ($debug) {
@@ -2108,7 +2117,17 @@ function woocommerce_ajax_add_to_cart() {
     $product_id = apply_filters('woocommerce_add_to_cart_product_id', $product_id);
     $quantity = empty($_POST['quantity']) ? 1 : wc_stock_amount($_POST['quantity']);
     $variation_id = isset($_POST['variation_id']) ? absint($_POST['variation_id']) : 0;
-    $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity);
+    // Получаем все атрибуты для вариативного товара
+    $variation_attributes = array();
+    if ($variation_id) {
+        foreach ($_POST as $key => $value) {
+            if (strpos($key, 'attribute_') === 0) {
+                $variation_attributes[sanitize_title($key)] = wc_clean($value);
+            }
+        }
+    }
+    
+    $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity, $variation_id, $variation_attributes);
     $product_status = get_post_status($product_id);
     
     if ($debug) {
@@ -2133,20 +2152,41 @@ function woocommerce_ajax_add_to_cart() {
     
     if (!$passed_validation) {
         if ($debug) error_log('ERROR: Validation failed');
-        wp_send_json_error('Ошибка валидации товара');
+        
+        // Получаем сообщения об ошибках WooCommerce
+        $notices = wc_get_notices('error');
+        $error_message = 'Ошибка валидации товара';
+        
+        if (!empty($notices)) {
+            $error_message = $notices[0]['notice'] ?? $error_message;
+            wc_clear_notices(); // Очищаем уведомления
+        }
+        
+        wp_send_json_error($error_message);
         return;
     }
     
-    // Проверяем, не добавлен ли уже товар в корзину (защита от двойного добавления)
-    $cart_item_key = WC()->cart->generate_cart_id($product_id, $variation_id);
-    $existing_cart_item = WC()->cart->find_product_in_cart($cart_item_key);
+    // Получаем товар для дополнительных проверок
+    $product = wc_get_product($variation_id ? $variation_id : $product_id);
     
-    if ($debug) {
-        error_log('Cart item key: ' . $cart_item_key);
-        error_log('Existing cart item: ' . ($existing_cart_item ? $existing_cart_item : 'NOT FOUND'));
+    // Проверяем ограничения на количество
+    if ($product && $product->is_sold_individually()) {
+        $cart_item_key = WC()->cart->generate_cart_id($product_id, $variation_id);
+        $existing_cart_item = WC()->cart->find_product_in_cart($cart_item_key);
+        
+        if ($existing_cart_item) {
+            if ($debug) error_log('Product sold individually and already in cart');
+            wp_send_json_error('Этот товар уже добавлен в корзину. Можно купить только одну единицу.');
+            return;
+        }
     }
     
-    $cart_result = WC()->cart->add_to_cart($product_id, $quantity, $variation_id);
+    if ($debug) {
+        error_log('Product sold individually: ' . ($product && $product->is_sold_individually() ? 'YES' : 'NO'));
+        error_log('Cart item key: ' . WC()->cart->generate_cart_id($product_id, $variation_id));
+    }
+    
+    $cart_result = WC()->cart->add_to_cart($product_id, $quantity, $variation_id, $variation_attributes);
     if ($debug) error_log('Cart add result: ' . ($cart_result ? 'SUCCESS' : 'FAILED'));
     
     if ($cart_result) {
@@ -2157,15 +2197,27 @@ function woocommerce_ajax_add_to_cart() {
         }
 
         if ($debug) error_log('SUCCESS: Product added to cart');
+        
+        // Очищаем буфер вывода перед отправкой фрагментов
+        ob_end_clean();
         WC_AJAX::get_refreshed_fragments();
     } else {
         if ($debug) error_log('ERROR: Failed to add product to cart');
-        $data = array(
-            'error' => true,
-            'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink($product_id), $product_id)
-        );
-        wp_send_json($data);
+        
+        // Получаем сообщения об ошибках WooCommerce
+        $notices = wc_get_notices('error');
+        $error_message = 'Не удалось добавить товар в корзину';
+        
+        if (!empty($notices)) {
+            $error_message = $notices[0]['notice'] ?? $error_message;
+            wc_clear_notices(); // Очищаем уведомления
+        }
+        
+        wp_send_json_error($error_message);
     }
+    
+    // Очищаем буфер вывода
+    ob_end_clean();
     wp_die();
 }
 
@@ -2307,6 +2359,12 @@ function ajax_cart_notifications_script() {
                     
                     if (productId && formData.indexOf('product_id=') === -1) {
                         formData += '&product_id=' + productId;
+                    }
+                    
+                    // Для вариативных товаров убеждаемся, что variation_id передается
+                    var variationId = $form.find('input[name="variation_id"]').val();
+                    if (variationId && formData.indexOf('variation_id=') === -1) {
+                        formData += '&variation_id=' + variationId;
                     }
                     
                     // console.log('Form data being sent:', formData); // DEBUG
