@@ -1746,13 +1746,63 @@ remove_action('woocommerce_single_product_summary', 'woocommerce_template_single
 // Функция вывода цены перед кнопкой (только для простых товаров)
 function alean_output_single_price_before_button() {
     global $product;
+    
+    // Отладка
+    $debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($debug) {
+        error_log('=== PRICE OUTPUT DEBUG ===');
+        error_log('Product exists: ' . (!empty($product) ? 'YES' : 'NO'));
+        if (!empty($product)) {
+            error_log('Product type: ' . $product->get_type());
+            error_log('Product ID: ' . $product->get_id());
+        }
+    }
+    
     // Не выводим цену для вариативных товаров, чтобы избежать дублирования с woocommerce-variation-price
     if ( empty( $product ) || ( $product instanceof WC_Product && $product->is_type('variable') ) ) {
+        if ($debug) error_log('Skipping price output for variable product or empty product');
         return;
     }
+    
+    if ($debug) error_log('Outputting price for simple product');
     woocommerce_template_single_price();
 }
 add_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
+
+// Дополнительно удаляем цену из других мест для вариативных товаров
+function remove_price_for_variable_products() {
+    global $product;
+    if (!empty($product) && $product->is_type('variable')) {
+        // Удаляем цену из области вариаций
+        remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
+        // Убираем цену перед кнопкой для вариативных товаров
+        remove_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
+    }
+}
+add_action('woocommerce_before_single_product_summary', 'remove_price_for_variable_products', 5);
+
+// Добавляем CSS для скрытия дублирующейся цены на вариативных товарах
+function hide_duplicate_price_for_variable_products() {
+    if (is_product()) {
+        global $product;
+        if (!empty($product) && $product->is_type('variable')) {
+            ?>
+            <style>
+            /* Скрываем цену перед кнопкой для вариативных товаров - оставляем только woocommerce-variation-price */
+            .single-product .product.product-type-variable .woocommerce-variation-add-to-cart > .price {
+                display: none !important;
+            }
+            
+            /* Убеждаемся, что цена вариации видна */
+            .single-product .woocommerce-variation-price {
+                display: block !important;
+            }
+            </style>
+            <?php
+        }
+    }
+}
+add_action('wp_head', 'hide_duplicate_price_for_variable_products');
 
 // Добавляем кастомный класс к заголовку "Цвет"
 function add_custom_class_to_specific_heading($block_content, $block) {
@@ -2085,6 +2135,15 @@ function woocommerce_ajax_add_to_cart() {
         if ($debug) error_log('ERROR: Validation failed');
         wp_send_json_error('Ошибка валидации товара');
         return;
+    }
+    
+    // Проверяем, не добавлен ли уже товар в корзину (защита от двойного добавления)
+    $cart_item_key = WC()->cart->generate_cart_id($product_id, $variation_id);
+    $existing_cart_item = WC()->cart->find_product_in_cart($cart_item_key);
+    
+    if ($debug) {
+        error_log('Cart item key: ' . $cart_item_key);
+        error_log('Existing cart item: ' . ($existing_cart_item ? $existing_cart_item : 'NOT FOUND'));
     }
     
     $cart_result = WC()->cart->add_to_cart($product_id, $quantity, $variation_id);
