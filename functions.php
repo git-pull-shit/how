@@ -287,7 +287,11 @@ require_once ASTRA_THEME_DIR . 'inc/core/deprecated/deprecated-functions.php';
 // Удаляем цену в валюте, оставляем только баллы
 add_filter('woocommerce_get_price_html', 'replace_money_with_points', 10, 2);
 function replace_money_with_points($price, $product) {
-    return wc_get_price_to_display($product) . ' <img src="https://test-merch.alean.ru/wp-content/uploads/2025/05/android-icon-192x192-1.png" width="17" alt="Логотип" class="logo">';
+    // Для вариативных товаров оставляем вывод WooCommerce (вариация сама рендерит правильную цену)
+    if ($product instanceof WC_Product && $product->is_type('variable')) {
+        return $price;
+    }
+    return wc_price( wc_get_price_to_display($product), array() ) . ' <img src="https://test-merch.alean.ru/wp-content/uploads/2025/05/android-icon-192x192-1.png" width="17" alt="Логотип" class="logo">';
 }
 // ОТКЛЮЧЕН: Добавляем виртуальный метод оплаты баллами (заменен на Alean_Loyalty_Payment_Gateway)
 // add_filter('woocommerce_payment_gateways', 'add_points_payment_gateway');
