@@ -1964,30 +1964,68 @@ add_action('wp_ajax_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart
 add_action('wp_ajax_nopriv_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart');
 
 function woocommerce_ajax_add_to_cart() {
+    // Отладочная информация (отключить в продакшене)
+    $debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($debug) {
+        error_log('=== AJAX ADD TO CART DEBUG ===');
+        error_log('POST data: ' . print_r($_POST, true));
+    }
+    
     // Для простых товаров product_id может передаваться в add-to-cart
     $product_id = isset($_POST['product_id']) && $_POST['product_id'] !== ''
         ? absint($_POST['product_id'])
         : ( isset($_POST['add-to-cart']) ? absint($_POST['add-to-cart']) : 0 );
     $product_id = apply_filters('woocommerce_add_to_cart_product_id', $product_id);
     $quantity = empty($_POST['quantity']) ? 1 : wc_stock_amount($_POST['quantity']);
-    $variation_id = absint($_POST['variation_id']);
+    $variation_id = isset($_POST['variation_id']) ? absint($_POST['variation_id']) : 0;
     $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity);
     $product_status = get_post_status($product_id);
+    
+    if ($debug) {
+        error_log('Extracted product_id: ' . $product_id);
+        error_log('Quantity: ' . $quantity);
+        error_log('Variation_id: ' . $variation_id);
+        error_log('Product status: ' . $product_status);
+        error_log('Validation passed: ' . ($passed_validation ? 'YES' : 'NO'));
+    }
 
-    if ($passed_validation && WC()->cart->add_to_cart($product_id, $quantity, $variation_id) && 'publish' === $product_status) {
+    if (!$product_id) {
+        if ($debug) error_log('ERROR: No product_id found');
+        wp_send_json_error('Не удалось определить ID товара');
+        return;
+    }
+    
+    if ($product_status !== 'publish') {
+        if ($debug) error_log('ERROR: Product status is not publish: ' . $product_status);
+        wp_send_json_error('Товар недоступен для покупки');
+        return;
+    }
+    
+    if (!$passed_validation) {
+        if ($debug) error_log('ERROR: Validation failed');
+        wp_send_json_error('Ошибка валидации товара');
+        return;
+    }
+    
+    $cart_result = WC()->cart->add_to_cart($product_id, $quantity, $variation_id);
+    if ($debug) error_log('Cart add result: ' . ($cart_result ? 'SUCCESS' : 'FAILED'));
+    
+    if ($cart_result) {
         do_action('woocommerce_ajax_added_to_cart', $product_id);
 
         if ('yes' === get_option('woocommerce_cart_redirect_after_add')) {
             wc_add_to_cart_message(array($product_id => $quantity), true);
         }
 
+        if ($debug) error_log('SUCCESS: Product added to cart');
         WC_AJAX::get_refreshed_fragments();
     } else {
+        if ($debug) error_log('ERROR: Failed to add product to cart');
         $data = array(
             'error' => true,
             'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink($product_id), $product_id)
         );
-        echo wp_send_json($data);
+        wp_send_json($data);
     }
     wp_die();
 }
@@ -1996,6 +2034,18 @@ function woocommerce_ajax_add_to_cart() {
 add_action('wp_footer', 'ajax_cart_notifications_script');
 function ajax_cart_notifications_script() {
     if (is_admin()) return;
+    
+    // Убеждаемся, что параметры WooCommerce доступны
+    if (!wp_script_is('wc-add-to-cart', 'done')) {
+        wp_localize_script('jquery', 'wc_add_to_cart_params', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'wc_ajax_url' => WC_AJAX::get_endpoint('%%endpoint%%'),
+            'i18n_view_cart' => esc_attr__('View cart', 'woocommerce'),
+            'cart_url' => apply_filters('woocommerce_add_to_cart_redirect', wc_get_cart_url(), null),
+            'is_cart' => is_cart(),
+            'cart_redirect_after_add' => get_option('woocommerce_cart_redirect_after_add')
+        ));
+    }
     ?>
     <script type="text/javascript">
     jQuery(document).ready(function($) {
@@ -2047,7 +2097,11 @@ function ajax_cart_notifications_script() {
             // Trigger event
             $(document.body).trigger('adding_to_cart', [$thisbutton, data]);
 
-            $.post(wc_add_to_cart_params.ajax_url, data, function(response) {
+            var ajaxUrl = (typeof wc_add_to_cart_params !== 'undefined' && wc_add_to_cart_params.ajax_url) 
+                          ? wc_add_to_cart_params.ajax_url 
+                          : '<?php echo admin_url('admin-ajax.php'); ?>';
+            
+            $.post(ajaxUrl, data, function(response) {
                 if (!response) {
                     return;
                 }
@@ -2106,15 +2160,44 @@ function ajax_cart_notifications_script() {
                     var formData = $form.serialize();
                     formData += '&action=woocommerce_ajax_add_to_cart';
                     
+                    // Для простых товаров убеждаемся, что product_id передается правильно
+                    var productId = $form.find('input[name="product_id"]').val() || 
+                                   $form.find('input[name="add-to-cart"]').val() ||
+                                   $form.find('button[name="add-to-cart"]').val();
+                    
+                    if (productId && formData.indexOf('product_id=') === -1) {
+                        formData += '&product_id=' + productId;
+                    }
+                    
+                    // console.log('Form data being sent:', formData); // DEBUG
+                    
                     $submitButton.addClass('loading').prop('disabled', true);
                     
-                    $.post(wc_add_to_cart_params.ajax_url, formData, function(response) {
+                    var ajaxUrl = (typeof wc_add_to_cart_params !== 'undefined' && wc_add_to_cart_params.ajax_url) 
+                                  ? wc_add_to_cart_params.ajax_url 
+                                  : '<?php echo admin_url('admin-ajax.php'); ?>';
+                    
+                    $.post(ajaxUrl, formData, function(response) {
+                        // console.log('AJAX response:', response); // DEBUG
+                        
                         if (!response) {
+                            console.error('Empty response from server');
+                            showCartNotification('Пустой ответ от сервера', 'error');
                             $form.data('submitting', false);
+                            $submitButton.removeClass('loading').prop('disabled', false);
+                            return;
+                        }
+
+                        if (response.success === false) {
+                            console.error('Server returned error:', response.data);
+                            showCartNotification('Ошибка: ' + (response.data || 'Неизвестная ошибка'), 'error');
+                            $form.data('submitting', false);
+                            $submitButton.removeClass('loading').prop('disabled', false);
                             return;
                         }
 
                         if (response.error && response.product_url) {
+                            console.log('Redirecting to product page due to error');
                             window.location = response.product_url;
                             return;
                         }
@@ -2133,8 +2216,10 @@ function ajax_cart_notifications_script() {
                         $submitButton.removeClass('loading').prop('disabled', false);
                         $form.data('submitting', false);
                         
-                    }).fail(function() {
-                        showCartNotification('Ошибка при добавлении товара в корзину', 'error');
+                    }).fail(function(xhr, status, error) {
+                        console.error('AJAX request failed:', status, error);
+                        console.error('Response text:', xhr.responseText);
+                        showCartNotification('Ошибка при добавлении товара в корзину: ' + error, 'error');
                         $submitButton.removeClass('loading').prop('disabled', false);
                         $form.data('submitting', false);
                     });
