@@ -1161,7 +1161,77 @@ public function process_payment($order_id) {
             'messages' => $e->getMessage()
         );
     }
-}
+    
+    /**
+     * Вспомогательные методы для работы с API
+     */
+    private function get_lp_data($email) {
+        $debug = defined('WP_DEBUG') && WP_DEBUG;
+        if ($debug) error_log('Requesting LP data for email: ' . $email);
+        
+        $response = alean_api_request(ALEAN_API_GET_LP_URL, ['email' => $email]);
+
+        if (is_wp_error($response)) {
+            if ($debug) error_log('LP Data API Error: ' . $response->get_error_message());
+            return ['lp-status' => 'FALSE', 'error' => $response->get_error_message()];
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        if ($debug) error_log('LP Data API Response: ' . $body);
+
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($debug) error_log('JSON decode error: ' . json_last_error_msg());
+            return ['lp-status' => 'FALSE', 'error' => 'Invalid JSON'];
+        }
+
+        return $data;
+    }
+    
+    private function spend_points($email, $sum, $order_id, $comment) {
+        $debug = defined('WP_DEBUG') && WP_DEBUG;
+        if ($debug) {
+            error_log('=== SPEND POINTS API CALL ===');
+            error_log('Email: ' . $email);
+            error_log('Sum: ' . $sum);
+            error_log('Order ID: ' . $order_id);
+            error_log('Comment: ' . $comment);
+        }
+        
+        $response = alean_api_request(ALEAN_API_SPEND_LP_URL, [
+            'email' => $email,
+            'sum' => $sum,
+            'eventexternalid' => $order_id,
+            'comment' => $comment
+        ]);
+        
+        if (is_wp_error($response)) {
+            if ($debug) error_log('WP_Error in spend_points: ' . $response->get_error_message());
+            return ['status' => 'error', 'message' => $response->get_error_message()];
+        }
+        
+        $body = wp_remote_retrieve_body($response);
+        $http_code = wp_remote_retrieve_response_code($response);
+        
+        if ($debug) {
+            error_log('HTTP Response Code: ' . $http_code);
+            error_log('Raw API Response Body: ' . $body);
+        }
+        
+        $decoded = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($debug) error_log('JSON Decode Error: ' . json_last_error_msg());
+            // Если JSON не валиден, но HTTP код успешный, считаем операцию успешной
+            if ($http_code >= 200 && $http_code < 300) {
+                if ($debug) error_log('HTTP code is successful, treating as success despite JSON error');
+                return ['status' => 'success', 'raw_response' => $body];
+            }
+            return ['status' => 'error', 'message' => 'Invalid JSON response: ' . json_last_error_msg()];
+        }
+        
+        if ($debug) error_log('Decoded response: ' . print_r($decoded, true));
+        return $decoded;
+    }
 }
 
 
@@ -1670,8 +1740,18 @@ add_action('after_setup_theme', 'register_user_menu');
 
 //-=-=-= WooCommerce настройки =-=-=-//
 
-// Перемещаем цену в карточке товара
+// Перемещаем цену в карточке товара - выводим перед кнопкой только для простых товаров
 remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
+
+// Функция вывода цены перед кнопкой (только для простых товаров)
+function alean_output_single_price_before_button() {
+    global $product;
+    // Не выводим цену для вариативных товаров, чтобы избежать дублирования с woocommerce-variation-price
+    if ( empty( $product ) || ( $product instanceof WC_Product && $product->is_type('variable') ) ) {
+        return;
+    }
+    woocommerce_template_single_price();
+}
 add_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
 
 // Добавляем кастомный класс к заголовку "Цвет"
@@ -2150,9 +2230,10 @@ function ajax_cart_notifications_script() {
                 
                 // Только если это AJAX запрос
                 if ($submitButton.hasClass('single_add_to_cart_button') && !$form.hasClass('no-ajax')) {
-                    if ($form.data('submitting')) {
+                    // Усиленная защита от двойной отправки
+                    if ($form.data('submitting') || $submitButton.hasClass('loading') || $submitButton.prop('disabled')) {
                         e.preventDefault();
-                        return;
+                        return false;
                     }
                     e.preventDefault();
                     $form.data('submitting', true);
