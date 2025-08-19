@@ -52,11 +52,11 @@ function alean_api_request($url, $data, $timeout = 15) {
  * Добавляем CSP заголовки для решения проблемы с worker'ами
  */
 function add_csp_headers() {
-    if (!is_admin()) {
+    if (!is_admin() && !headers_sent()) {
         header("Content-Security-Policy: script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://*.googleapis.com https://*.gstatic.com blob:; worker-src 'self' blob:;");
     }
 }
-add_action('send_headers', 'add_csp_headers');
+add_action('template_redirect', 'add_csp_headers', 1);
 
 /**
  * ВРЕМЕННАЯ функция для тестирования API (удалить после отладки)
@@ -1161,7 +1161,77 @@ public function process_payment($order_id) {
             'messages' => $e->getMessage()
         );
     }
-}
+    
+    /**
+     * Вспомогательные методы для работы с API
+     */
+    private function get_lp_data($email) {
+        $debug = defined('WP_DEBUG') && WP_DEBUG;
+        if ($debug) error_log('Requesting LP data for email: ' . $email);
+        
+        $response = alean_api_request(ALEAN_API_GET_LP_URL, ['email' => $email]);
+
+        if (is_wp_error($response)) {
+            if ($debug) error_log('LP Data API Error: ' . $response->get_error_message());
+            return ['lp-status' => 'FALSE', 'error' => $response->get_error_message()];
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        if ($debug) error_log('LP Data API Response: ' . $body);
+
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($debug) error_log('JSON decode error: ' . json_last_error_msg());
+            return ['lp-status' => 'FALSE', 'error' => 'Invalid JSON'];
+        }
+
+        return $data;
+    }
+    
+    private function spend_points($email, $sum, $order_id, $comment) {
+        $debug = defined('WP_DEBUG') && WP_DEBUG;
+        if ($debug) {
+            error_log('=== SPEND POINTS API CALL ===');
+            error_log('Email: ' . $email);
+            error_log('Sum: ' . $sum);
+            error_log('Order ID: ' . $order_id);
+            error_log('Comment: ' . $comment);
+        }
+        
+        $response = alean_api_request(ALEAN_API_SPEND_LP_URL, [
+            'email' => $email,
+            'sum' => $sum,
+            'eventexternalid' => $order_id,
+            'comment' => $comment
+        ]);
+        
+        if (is_wp_error($response)) {
+            if ($debug) error_log('WP_Error in spend_points: ' . $response->get_error_message());
+            return ['status' => 'error', 'message' => $response->get_error_message()];
+        }
+        
+        $body = wp_remote_retrieve_body($response);
+        $http_code = wp_remote_retrieve_response_code($response);
+        
+        if ($debug) {
+            error_log('HTTP Response Code: ' . $http_code);
+            error_log('Raw API Response Body: ' . $body);
+        }
+        
+        $decoded = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($debug) error_log('JSON Decode Error: ' . json_last_error_msg());
+            // Если JSON не валиден, но HTTP код успешный, считаем операцию успешной
+            if ($http_code >= 200 && $http_code < 300) {
+                if ($debug) error_log('HTTP code is successful, treating as success despite JSON error');
+                return ['status' => 'success', 'raw_response' => $body];
+            }
+            return ['status' => 'error', 'message' => 'Invalid JSON response: ' . json_last_error_msg()];
+        }
+        
+        if ($debug) error_log('Decoded response: ' . print_r($decoded, true));
+        return $decoded;
+    }
 }
 
 
@@ -1652,8 +1722,6 @@ add_action('after_setup_theme', 'register_user_menu');
 
 
 
-remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
-add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single_price', 5);
 
 
 
@@ -1672,9 +1740,69 @@ add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single
 
 //-=-=-= WooCommerce настройки =-=-=-//
 
-// Перемещаем цену в карточке товара
+// Перемещаем цену в карточке товара - выводим перед кнопкой только для простых товаров
 remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
-add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single_price', 5);
+
+// Функция вывода цены перед кнопкой (только для простых товаров)
+function alean_output_single_price_before_button() {
+    global $product;
+    
+    // Отладка
+    $debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($debug) {
+        error_log('=== PRICE OUTPUT DEBUG ===');
+        error_log('Product exists: ' . (!empty($product) ? 'YES' : 'NO'));
+        if (!empty($product)) {
+            error_log('Product type: ' . $product->get_type());
+            error_log('Product ID: ' . $product->get_id());
+        }
+    }
+    
+    // Не выводим цену для вариативных товаров, чтобы избежать дублирования с woocommerce-variation-price
+    if ( empty( $product ) || ( $product instanceof WC_Product && $product->is_type('variable') ) ) {
+        if ($debug) error_log('Skipping price output for variable product or empty product');
+        return;
+    }
+    
+    if ($debug) error_log('Outputting price for simple product');
+    woocommerce_template_single_price();
+}
+add_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
+
+// Дополнительно удаляем цену из других мест для вариативных товаров
+function remove_price_for_variable_products() {
+    global $product;
+    if (!empty($product) && $product->is_type('variable')) {
+        // Удаляем цену из области вариаций
+        remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
+        // Убираем цену перед кнопкой для вариативных товаров
+        remove_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
+    }
+}
+add_action('woocommerce_before_single_product_summary', 'remove_price_for_variable_products', 5);
+
+// Добавляем CSS для скрытия дублирующейся цены на вариативных товарах
+function hide_duplicate_price_for_variable_products() {
+    if (is_product()) {
+        global $product;
+        if (!empty($product) && $product->is_type('variable')) {
+            ?>
+            <style>
+            /* Скрываем цену перед кнопкой для вариативных товаров - оставляем только woocommerce-variation-price */
+            .single-product .product.product-type-variable .woocommerce-variation-add-to-cart > .price {
+                display: none !important;
+            }
+            
+            /* Убеждаемся, что цена вариации видна */
+            .single-product .woocommerce-variation-price {
+                display: block !important;
+            }
+            </style>
+            <?php
+        }
+    }
+}
+add_action('wp_head', 'hide_duplicate_price_for_variable_products');
 
 // Добавляем кастомный класс к заголовку "Цвет"
 function add_custom_class_to_specific_heading($block_content, $block) {
@@ -1966,27 +2094,130 @@ add_action('wp_ajax_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart
 add_action('wp_ajax_nopriv_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart');
 
 function woocommerce_ajax_add_to_cart() {
-    $product_id = apply_filters('woocommerce_add_to_cart_product_id', absint($_POST['product_id']));
+    // Начинаем буферизацию вывода для предотвращения проблем с заголовками
+    ob_start();
+    
+    // Отключаем вывод ошибок в AJAX запросах
+    if (!defined('WP_DEBUG') || !WP_DEBUG) {
+        error_reporting(0);
+        ini_set('display_errors', 0);
+    }
+    
+    // Отладочная информация (отключить в продакшене)
+    $debug = defined('WP_DEBUG') && WP_DEBUG;
+    if ($debug) {
+        error_log('=== AJAX ADD TO CART DEBUG ===');
+        error_log('POST data: ' . print_r($_POST, true));
+    }
+    
+    // Для простых товаров product_id может передаваться в add-to-cart
+    $product_id = isset($_POST['product_id']) && $_POST['product_id'] !== ''
+        ? absint($_POST['product_id'])
+        : ( isset($_POST['add-to-cart']) ? absint($_POST['add-to-cart']) : 0 );
+    $product_id = apply_filters('woocommerce_add_to_cart_product_id', $product_id);
     $quantity = empty($_POST['quantity']) ? 1 : wc_stock_amount($_POST['quantity']);
-    $variation_id = absint($_POST['variation_id']);
-    $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity);
+    $variation_id = isset($_POST['variation_id']) ? absint($_POST['variation_id']) : 0;
+    // Получаем все атрибуты для вариативного товара
+    $variation_attributes = array();
+    if ($variation_id) {
+        foreach ($_POST as $key => $value) {
+            if (strpos($key, 'attribute_') === 0) {
+                $variation_attributes[sanitize_title($key)] = wc_clean($value);
+            }
+        }
+    }
+    
+    $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity, $variation_id, $variation_attributes);
     $product_status = get_post_status($product_id);
+    
+    if ($debug) {
+        error_log('Extracted product_id: ' . $product_id);
+        error_log('Quantity: ' . $quantity);
+        error_log('Variation_id: ' . $variation_id);
+        error_log('Product status: ' . $product_status);
+        error_log('Validation passed: ' . ($passed_validation ? 'YES' : 'NO'));
+    }
 
-    if ($passed_validation && WC()->cart->add_to_cart($product_id, $quantity, $variation_id) && 'publish' === $product_status) {
+    if (!$product_id) {
+        if ($debug) error_log('ERROR: No product_id found');
+        wp_send_json_error('Не удалось определить ID товара');
+        return;
+    }
+    
+    if ($product_status !== 'publish') {
+        if ($debug) error_log('ERROR: Product status is not publish: ' . $product_status);
+        wp_send_json_error('Товар недоступен для покупки');
+        return;
+    }
+    
+    if (!$passed_validation) {
+        if ($debug) error_log('ERROR: Validation failed');
+        
+        // Получаем сообщения об ошибках WooCommerce
+        $notices = wc_get_notices('error');
+        $error_message = 'Ошибка валидации товара';
+        
+        if (!empty($notices)) {
+            $error_message = $notices[0]['notice'] ?? $error_message;
+            wc_clear_notices(); // Очищаем уведомления
+        }
+        
+        wp_send_json_error($error_message);
+        return;
+    }
+    
+    // Получаем товар для дополнительных проверок
+    $product = wc_get_product($variation_id ? $variation_id : $product_id);
+    
+    // Проверяем ограничения на количество
+    if ($product && $product->is_sold_individually()) {
+        $cart_item_key = WC()->cart->generate_cart_id($product_id, $variation_id);
+        $existing_cart_item = WC()->cart->find_product_in_cart($cart_item_key);
+        
+        if ($existing_cart_item) {
+            if ($debug) error_log('Product sold individually and already in cart');
+            wp_send_json_error('Этот товар уже добавлен в корзину. Можно купить только одну единицу.');
+            return;
+        }
+    }
+    
+    if ($debug) {
+        error_log('Product sold individually: ' . ($product && $product->is_sold_individually() ? 'YES' : 'NO'));
+        error_log('Cart item key: ' . WC()->cart->generate_cart_id($product_id, $variation_id));
+    }
+    
+    $cart_result = WC()->cart->add_to_cart($product_id, $quantity, $variation_id, $variation_attributes);
+    if ($debug) error_log('Cart add result: ' . ($cart_result ? 'SUCCESS' : 'FAILED'));
+    
+    if ($cart_result) {
         do_action('woocommerce_ajax_added_to_cart', $product_id);
 
         if ('yes' === get_option('woocommerce_cart_redirect_after_add')) {
             wc_add_to_cart_message(array($product_id => $quantity), true);
         }
 
+        if ($debug) error_log('SUCCESS: Product added to cart');
+        
+        // Очищаем буфер вывода перед отправкой фрагментов
+        ob_end_clean();
         WC_AJAX::get_refreshed_fragments();
     } else {
-        $data = array(
-            'error' => true,
-            'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink($product_id), $product_id)
-        );
-        echo wp_send_json($data);
+        if ($debug) error_log('ERROR: Failed to add product to cart');
+        
+        // Получаем сообщения об ошибках WooCommerce
+        $notices = wc_get_notices('error');
+        $error_message = 'Не удалось добавить товар в корзину';
+        
+        if (!empty($notices)) {
+            $error_message = $notices[0]['notice'] ?? $error_message;
+            wc_clear_notices(); // Очищаем уведомления
+        }
+        
+        wp_send_json_error($error_message);
     }
+    
+    // Очищаем буфер вывода
+    ob_end_clean();
     wp_die();
 }
 
@@ -1994,6 +2225,18 @@ function woocommerce_ajax_add_to_cart() {
 add_action('wp_footer', 'ajax_cart_notifications_script');
 function ajax_cart_notifications_script() {
     if (is_admin()) return;
+    
+    // Убеждаемся, что параметры WooCommerce доступны
+    if (!wp_script_is('wc-add-to-cart', 'done')) {
+        wp_localize_script('jquery', 'wc_add_to_cart_params', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'wc_ajax_url' => WC_AJAX::get_endpoint('%%endpoint%%'),
+            'i18n_view_cart' => esc_attr__('View cart', 'woocommerce'),
+            'cart_url' => apply_filters('woocommerce_add_to_cart_redirect', wc_get_cart_url(), null),
+            'is_cart' => is_cart(),
+            'cart_redirect_after_add' => get_option('woocommerce_cart_redirect_after_add')
+        ));
+    }
     ?>
     <script type="text/javascript">
     jQuery(document).ready(function($) {
@@ -2045,7 +2288,11 @@ function ajax_cart_notifications_script() {
             // Trigger event
             $(document.body).trigger('adding_to_cart', [$thisbutton, data]);
 
-            $.post(wc_add_to_cart_params.ajax_url, data, function(response) {
+            var ajaxUrl = (typeof wc_add_to_cart_params !== 'undefined' && wc_add_to_cart_params.ajax_url) 
+                          ? wc_add_to_cart_params.ajax_url 
+                          : '<?php echo admin_url('admin-ajax.php'); ?>';
+            
+            $.post(ajaxUrl, data, function(response) {
                 if (!response) {
                     return;
                 }
@@ -2083,47 +2330,99 @@ function ajax_cart_notifications_script() {
         });
 
         // Обработчик для страницы товара
-        $('form.cart').on('submit', function(e) {
+        $('form.cart').each(function() {
             var $form = $(this);
-            var $submitButton = $form.find('button[type="submit"]');
-            
-            // Только если это AJAX запрос
-            if ($submitButton.hasClass('single_add_to_cart_button') && !$form.hasClass('no-ajax')) {
-                e.preventDefault();
+            if ($form.data('ajax-bind-initialized')) return;
+            $form.data('ajax-bind-initialized', true);
+
+            $form.on('submit', function(e) {
+                var $form = $(this);
+                var $submitButton = $form.find('button[type="submit"]');
                 
-                var formData = $form.serialize();
-                formData += '&action=woocommerce_ajax_add_to_cart';
-                
-                $submitButton.addClass('loading').prop('disabled', true);
-                
-                $.post(wc_add_to_cart_params.ajax_url, formData, function(response) {
-                    if (!response) {
-                        return;
+                // Только если это AJAX запрос
+                if ($submitButton.hasClass('single_add_to_cart_button') && !$form.hasClass('no-ajax')) {
+                    // Усиленная защита от двойной отправки
+                    if ($form.data('submitting') || $submitButton.hasClass('loading') || $submitButton.prop('disabled')) {
+                        e.preventDefault();
+                        return false;
                     }
-
-                    if (response.error && response.product_url) {
-                        window.location = response.product_url;
-                        return;
-                    }
-
-                    // Показываем уведомление
-                    var productName = $('.product_title').text() || 'Товар';
-                    showCartNotification('✓ ' + productName + ' добавлен в корзину!', 'success');
-
-                    // Обновляем фрагменты корзины
-                    if (response.fragments) {
-                        $.each(response.fragments, function(key, value) {
-                            $(key).replaceWith(value);
-                        });
-                    }
-
-                    $submitButton.removeClass('loading').prop('disabled', false);
+                    e.preventDefault();
+                    $form.data('submitting', true);
                     
-                }).fail(function() {
-                    showCartNotification('Ошибка при добавлении товара в корзину', 'error');
-                    $submitButton.removeClass('loading').prop('disabled', false);
-                });
-            }
+                    var formData = $form.serialize();
+                    formData += '&action=woocommerce_ajax_add_to_cart';
+                    
+                    // Для простых товаров убеждаемся, что product_id передается правильно
+                    var productId = $form.find('input[name="product_id"]').val() || 
+                                   $form.find('input[name="add-to-cart"]').val() ||
+                                   $form.find('button[name="add-to-cart"]').val();
+                    
+                    if (productId && formData.indexOf('product_id=') === -1) {
+                        formData += '&product_id=' + productId;
+                    }
+                    
+                    // Для вариативных товаров убеждаемся, что variation_id передается
+                    var variationId = $form.find('input[name="variation_id"]').val();
+                    if (variationId && formData.indexOf('variation_id=') === -1) {
+                        formData += '&variation_id=' + variationId;
+                    }
+                    
+                    // console.log('Form data being sent:', formData); // DEBUG
+                    
+                    $submitButton.addClass('loading').prop('disabled', true);
+                    
+                    var ajaxUrl = (typeof wc_add_to_cart_params !== 'undefined' && wc_add_to_cart_params.ajax_url) 
+                                  ? wc_add_to_cart_params.ajax_url 
+                                  : '<?php echo admin_url('admin-ajax.php'); ?>';
+                    
+                    $.post(ajaxUrl, formData, function(response) {
+                        // console.log('AJAX response:', response); // DEBUG
+                        
+                        if (!response) {
+                            console.error('Empty response from server');
+                            showCartNotification('Пустой ответ от сервера', 'error');
+                            $form.data('submitting', false);
+                            $submitButton.removeClass('loading').prop('disabled', false);
+                            return;
+                        }
+
+                        if (response.success === false) {
+                            console.error('Server returned error:', response.data);
+                            showCartNotification('Ошибка: ' + (response.data || 'Неизвестная ошибка'), 'error');
+                            $form.data('submitting', false);
+                            $submitButton.removeClass('loading').prop('disabled', false);
+                            return;
+                        }
+
+                        if (response.error && response.product_url) {
+                            console.log('Redirecting to product page due to error');
+                            window.location = response.product_url;
+                            return;
+                        }
+
+                        // Показываем уведомление
+                        var productName = $('.product_title').text() || 'Товар';
+                        showCartNotification('✓ ' + productName + ' добавлен в корзину!', 'success');
+
+                        // Обновляем фрагменты корзины
+                        if (response.fragments) {
+                            $.each(response.fragments, function(key, value) {
+                                $(key).replaceWith(value);
+                            });
+                        }
+
+                        $submitButton.removeClass('loading').prop('disabled', false);
+                        $form.data('submitting', false);
+                        
+                    }).fail(function(xhr, status, error) {
+                        console.error('AJAX request failed:', status, error);
+                        console.error('Response text:', xhr.responseText);
+                        showCartNotification('Ошибка при добавлении товара в корзину: ' + error, 'error');
+                        $submitButton.removeClass('loading').prop('disabled', false);
+                        $form.data('submitting', false);
+                    });
+                }
+            });
         });
     });
     </script>
