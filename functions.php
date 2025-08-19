@@ -1653,7 +1653,15 @@ add_action('after_setup_theme', 'register_user_menu');
 
 
 remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
-add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single_price', 5);
+// Выводим цену перед кнопкой только для простых товаров, чтобы избежать дублирования на вариативных
+function alean_output_single_price_before_button() {
+    global $product;
+    if ( empty( $product ) || ( $product instanceof WC_Product && $product->is_type('variable') ) ) {
+        return;
+    }
+    woocommerce_template_single_price();
+}
+add_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
 
 
 
@@ -1674,7 +1682,7 @@ add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single
 
 // Перемещаем цену в карточке товара
 remove_action('woocommerce_single_product_summary', 'woocommerce_template_single_price', 10);
-add_action('woocommerce_before_add_to_cart_button', 'woocommerce_template_single_price', 5);
+add_action('woocommerce_before_add_to_cart_button', 'alean_output_single_price_before_button', 5);
 
 // Добавляем кастомный класс к заголовку "Цвет"
 function add_custom_class_to_specific_heading($block_content, $block) {
