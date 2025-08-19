@@ -1974,7 +1974,11 @@ add_action('wp_ajax_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart
 add_action('wp_ajax_nopriv_woocommerce_ajax_add_to_cart', 'woocommerce_ajax_add_to_cart');
 
 function woocommerce_ajax_add_to_cart() {
-    $product_id = apply_filters('woocommerce_add_to_cart_product_id', absint($_POST['product_id']));
+    // Для простых товаров product_id может передаваться в add-to-cart
+    $product_id = isset($_POST['product_id']) && $_POST['product_id'] !== ''
+        ? absint($_POST['product_id'])
+        : ( isset($_POST['add-to-cart']) ? absint($_POST['add-to-cart']) : 0 );
+    $product_id = apply_filters('woocommerce_add_to_cart_product_id', $product_id);
     $quantity = empty($_POST['quantity']) ? 1 : wc_stock_amount($_POST['quantity']);
     $variation_id = absint($_POST['variation_id']);
     $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity);
@@ -2091,47 +2095,61 @@ function ajax_cart_notifications_script() {
         });
 
         // Обработчик для страницы товара
-        $('form.cart').on('submit', function(e) {
+        $('form.cart').each(function() {
             var $form = $(this);
-            var $submitButton = $form.find('button[type="submit"]');
-            
-            // Только если это AJAX запрос
-            if ($submitButton.hasClass('single_add_to_cart_button') && !$form.hasClass('no-ajax')) {
-                e.preventDefault();
+            if ($form.data('ajax-bind-initialized')) return;
+            $form.data('ajax-bind-initialized', true);
+
+            $form.on('submit', function(e) {
+                var $form = $(this);
+                var $submitButton = $form.find('button[type="submit"]');
                 
-                var formData = $form.serialize();
-                formData += '&action=woocommerce_ajax_add_to_cart';
-                
-                $submitButton.addClass('loading').prop('disabled', true);
-                
-                $.post(wc_add_to_cart_params.ajax_url, formData, function(response) {
-                    if (!response) {
+                // Только если это AJAX запрос
+                if ($submitButton.hasClass('single_add_to_cart_button') && !$form.hasClass('no-ajax')) {
+                    if ($form.data('submitting')) {
+                        e.preventDefault();
                         return;
                     }
-
-                    if (response.error && response.product_url) {
-                        window.location = response.product_url;
-                        return;
-                    }
-
-                    // Показываем уведомление
-                    var productName = $('.product_title').text() || 'Товар';
-                    showCartNotification('✓ ' + productName + ' добавлен в корзину!', 'success');
-
-                    // Обновляем фрагменты корзины
-                    if (response.fragments) {
-                        $.each(response.fragments, function(key, value) {
-                            $(key).replaceWith(value);
-                        });
-                    }
-
-                    $submitButton.removeClass('loading').prop('disabled', false);
+                    e.preventDefault();
+                    $form.data('submitting', true);
                     
-                }).fail(function() {
-                    showCartNotification('Ошибка при добавлении товара в корзину', 'error');
-                    $submitButton.removeClass('loading').prop('disabled', false);
-                });
-            }
+                    var formData = $form.serialize();
+                    formData += '&action=woocommerce_ajax_add_to_cart';
+                    
+                    $submitButton.addClass('loading').prop('disabled', true);
+                    
+                    $.post(wc_add_to_cart_params.ajax_url, formData, function(response) {
+                        if (!response) {
+                            $form.data('submitting', false);
+                            return;
+                        }
+
+                        if (response.error && response.product_url) {
+                            window.location = response.product_url;
+                            return;
+                        }
+
+                        // Показываем уведомление
+                        var productName = $('.product_title').text() || 'Товар';
+                        showCartNotification('✓ ' + productName + ' добавлен в корзину!', 'success');
+
+                        // Обновляем фрагменты корзины
+                        if (response.fragments) {
+                            $.each(response.fragments, function(key, value) {
+                                $(key).replaceWith(value);
+                            });
+                        }
+
+                        $submitButton.removeClass('loading').prop('disabled', false);
+                        $form.data('submitting', false);
+                        
+                    }).fail(function() {
+                        showCartNotification('Ошибка при добавлении товара в корзину', 'error');
+                        $submitButton.removeClass('loading').prop('disabled', false);
+                        $form.data('submitting', false);
+                    });
+                }
+            });
         });
     });
     </script>
