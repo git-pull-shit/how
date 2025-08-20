@@ -2137,13 +2137,28 @@ function ajax_cart_notifications_script() {
 
 
 
-// Блокировка доступа к author и users endpoint
-add_action('init', 'block_author_and_users_endpoint');
-function block_author_and_users_endpoint() {
-    if (isset($_GET['author']) || (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], 'rest_route=/wp/v2/users/') !== false)) {
-        wp_die('Доступ запрещен', 403);
+
+//  эндпоинт пользователей
+add_filter('rest_endpoints', function($endpoints) {
+    if (isset($endpoints['/wp/v2/users'])) {
+        unset($endpoints['/wp/v2/users']);
     }
-}
+    if (isset($endpoints['/wp/v2/users/(?P<id>[\d]+)'])) {
+        unset($endpoints['/wp/v2/users/(?P<id>[\d]+)']);
+    }
+    return $endpoints;
+});
+
+// Или ограничиваем доступ только для авторизованных пользователей
+add_filter('rest_endpoints', function($endpoints) {
+    if (isset($endpoints['/wp/v2/users'])) {
+        $endpoints['/wp/v2/users'][0]['args']['show_in_rest']['required'] = true;
+        $endpoints['/wp/v2/users'][0]['permission_callback'] = function() {
+            return current_user_can('edit_posts');
+        };
+    }
+    return $endpoints;
+});
 
 
 
@@ -2290,8 +2305,6 @@ function register_dadata_assets() {
 }
 
 
-
-
 function my_theme_setup() {
 
     add_theme_support('menus');
@@ -2303,6 +2316,11 @@ function my_theme_setup() {
     ));
 }
 add_action('after_setup_theme', 'my_theme_setup');
+
+
+
+
+
 
 
 
